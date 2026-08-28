@@ -63,6 +63,7 @@ To run your own pretrained models:
 ## 3. Performances on TUAB
 - The first six models are trained from scratch. The last three models used the pre-trained BIOT.
 
+
 | Models |   Balanced Acc. |   AUC-PR    | AUROC |
 |--------------------------|:------------------------:|:------------------------:|:------------------------:|
 | SPaRCNet                                                     | 0.7896  | 0.8414   | 0.8676   |
@@ -83,6 +84,42 @@ python run_binary_supervised.py --dataset TUAB --in_channels 16 --sampling_rate 
 python run_binary_supervised.py --dataset TUAB --in_channels 18 --sampling_rate 200 --token_size 200 --hop_length 100 --sample_length 10 --batch_size 512 --model BIOT --pretrain_model_path pretrained-models/EEG-SHHS+PREST-18-channels.ckpt
 python run_binary_supervised.py --dataset TUAB --in_channels 18 --sampling_rate 200 --token_size 200 --hop_length 100 --sample_length 10 --batch_size 512 --model BIOT --pretrain_model_path pretrained-models/EEG-six-datasets-18-channels.ckpt
 ```
+
+## EvoBrain-contract seizure detection
+
+`run_binary_supervised.py` now has dedicated `TUSZ` and `CHB-MIT` branches for
+raw ten-second seizure clips. BIOT receives `[batch, channel, 2000]` only at its
+existing model boundary; the loader-facing batch remains
+`(x, y, seq_len, supports, adj_mat, writeout_fn)`. BIOT computes its STFT
+internally, so `--use_fft` is rejected.
+
+For raw TUSZ EDF recordings:
+
+```bash
+python run_binary_supervised.py --dataset TUSZ --model BIOT \
+  --raw_data_dir /path/to/tusz --no-use_fft \
+  --scaler_mean_path /path/to/raw-train-mean.pkl \
+  --scaler_std_path /path/to/raw-train-std.pkl --result_dir ./tusz-results
+```
+
+For already segmented CHB-MIT PKLs:
+
+```bash
+python run_binary_supervised.py --dataset CHB-MIT --model BIOT \
+  --input_dir /path/to/chb-pkls --no-use_fft --result_dir ./chb-results
+```
+
+The PKL path does not segment CHB-MIT. If, and only if, the files were produced
+by this repository's `datasets/CHB-MIT/process2.py`, add
+`--chb_channel_order biot_process2`. That declaration permits reuse of the
+matching first 16 pretrained channel rows. With absent/unknown channel metadata,
+or for TUSZ's 19 referential channels, only the checkpoint's channel embedding
+and index are reinitialized; compatible non-channel encoder weights are loaded.
+
+Training derives CHB-MIT positive weighting from the training PKLs. Evaluation
+uses unweighted binary cross entropy, chooses a maximum-F1 threshold on dev,
+reuses it on test, and writes traceable `dev_results.npz` and
+`test_results.npz` files. No input-value clamp is applied.
 
 ## 4. Performance on TUEV
 - The first six models are trained from scratch. The last three models used the pre-trained BIOT.

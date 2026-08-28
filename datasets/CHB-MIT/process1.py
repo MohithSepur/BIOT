@@ -9,6 +9,7 @@ import bz2
 import pickle
 import _pickle as cPickle
 import multiprocessing as mp
+import argparse
 
 
 # Pickle a file and then compress it into a file with extension
@@ -231,11 +232,8 @@ def start_process(pacient, num, start, end, sum_ind):
 
 
 # PARAMETERS
-signals_path = "/srv/local/data/physionet.org/files/chbmit/1.0.0"  # Path to the data main directory
-clean_path = "/srv/local/data/physionet.org/files/chbmit/1.0.0/clean_signals"  # Path where to store clean data
-
-if not os.path.exists(clean_path):
-    os.makedirs(clean_path)
+signals_path = None
+clean_path = None
 
 # Clean pacients one by one manually with these parameters
 pacient = "04"
@@ -272,5 +270,17 @@ parameters = [
     ("19", "02", 1, 30, 1),
 ]
 
-with mp.Pool(mp.cpu_count()) as pool:
-    res = pool.starmap(start_process, parameters)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_dir", required=True, help="CHB-MIT source directory")
+    parser.add_argument("--output_dir", required=True, help="cleaned recording destination")
+    args = parser.parse_args()
+    global signals_path, clean_path
+    signals_path, clean_path = args.input_dir, args.output_dir
+    os.makedirs(clean_path, exist_ok=True)
+    with mp.Pool(mp.cpu_count()) as pool:
+        pool.starmap(start_process, parameters)
+
+
+if __name__ == "__main__":
+    main()

@@ -7,30 +7,47 @@ from tqdm import tqdm
 import numpy as np
 import torch.nn as nn
 
-import pytorch_lightning as pl
-from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.strategies import DDPStrategy
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.callbacks.early_stopping import EarlyStopping
-from pyhealth.metrics import binary_metrics_fn
+try:
+    import pytorch_lightning as pl
+    from pytorch_lightning.loggers import TensorBoardLogger
+    from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+except ModuleNotFoundError:
+    pl = None
+    TensorBoardLogger = None
+    EarlyStopping = None
 
-from model import (
-    SPaRCNet,
-    ContraWR,
-    CNNTransformer,
-    FFCL,
-    STTransformer,
-    BIOTClassifier,
-)
+try:
+    from pyhealth.metrics import binary_metrics_fn
+except ModuleNotFoundError:
+    binary_metrics_fn = None
+
+try:
+    from model import (
+        SPaRCNet,
+        ContraWR,
+        CNNTransformer,
+        FFCL,
+        STTransformer,
+        BIOTClassifier,
+    )
+    _MODEL_IMPORT_ERROR = None
+except ModuleNotFoundError as error:
+    SPaRCNet = ContraWR = CNNTransformer = FFCL = STTransformer = BIOTClassifier = None
+    _MODEL_IMPORT_ERROR = error
 from utils import TUABLoader, CHBMITLoader, PTBLoader, focal_loss, BCE
 
 
-class LitModel_finetune(pl.LightningModule):
+_LightningModule = pl.LightningModule if pl is not None else nn.Module
+
+
+class LitModel_finetune(_LightningModule):
     def __init__(self, args, model):
         super().__init__()
         self.model = model
         self.threshold = 0.5
         self.args = args
+        self.validation_outputs = []
+        self.test_outputs = []
 
     def training_step(self, batch, batch_idx):
         X, y = batch
@@ -45,14 +62,15 @@ class LitModel_finetune(pl.LightningModule):
             prob = self.model(X)
             step_result = torch.sigmoid(prob).cpu().numpy()
             step_gt = y.cpu().numpy()
-        return step_result, step_gt
+        self.validation_outputs.append((step_result, step_gt))
 
-    def validation_epoch_end(self, val_step_outputs):
+    def on_validation_epoch_end(self):
         result = np.array([])
         gt = np.array([])
-        for out in val_step_outputs:
+        for out in self.validation_outputs:
             result = np.append(result, out[0])
             gt = np.append(gt, out[1])
+        self.validation_outputs.clear()
 
         if (
             sum(gt) * (len(gt) - sum(gt)) != 0
@@ -83,14 +101,15 @@ class LitModel_finetune(pl.LightningModule):
             convScore = self.model(X)
             step_result = torch.sigmoid(convScore).cpu().numpy()
             step_gt = y.cpu().numpy()
-        return step_result, step_gt
+        self.test_outputs.append((step_result, step_gt))
 
-    def test_epoch_end(self, test_step_outputs):
+    def on_test_epoch_end(self):
         result = np.array([])
         gt = np.array([])
-        for out in test_step_outputs:
+        for out in self.test_outputs:
             result = np.append(result, out[0])
             gt = np.append(gt, out[1])
+        self.test_outputs.clear()
         if (
             sum(gt) * (len(gt) - sum(gt)) != 0
         ):  # to prevent all 0 or all 1 and raise the AUROC error
@@ -132,7 +151,9 @@ def prepare_TUAB_dataloader(args):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    root = "/srv/local/data/TUH/tuh3/tuh_eeg_abnormal/v3.0.0/edf/processed"
+    root = args.input_dir
+    if not root:
+        raise ValueError("--input_dir is required for TUAB")
 
     train_files = os.listdir(os.path.join(root, "train"))
     np.random.shuffle(train_files)
@@ -178,7 +199,9 @@ def prepare_CHB_MIT_dataloader(args):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    root = "/srv/local/data/physionet.org/files/chbmit/1.0.0/clean_segments"
+    root = args.input_dir
+    if not root:
+        raise ValueError("--input_dir is required for CHB-MIT")
 
     train_files = os.listdir(os.path.join(root, "train"))
     val_files = os.listdir(os.path.join(root, "val"))
@@ -223,7 +246,9 @@ def prepare_PTB_dataloader(args):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    root = "/srv/local/data/WFDB/processed2"
+    root = args.input_dir
+    if not root:
+        raise ValueError("--input_dir is required for PTB")
 
     train_files = os.listdir(os.path.join(root, "train"))
     val_files = os.listdir(os.path.join(root, "val"))
@@ -260,6 +285,17 @@ def prepare_PTB_dataloader(args):
 
 
 def supervised(args):
+    if args.dataset in {"TUSZ", "CHB-MIT"}:
+        from seizure_training import run_seizure_supervised
+
+        return run_seizure_supervised(args)
+
+    if pl is None:
+        raise RuntimeError("Legacy supervised tasks require pytorch_lightning")
+    if binary_metrics_fn is None:
+        raise RuntimeError("Legacy supervised tasks require pyhealth")
+    if _MODEL_IMPORT_ERROR is not None:
+        raise RuntimeError("A legacy model dependency is unavailable") from _MODEL_IMPORT_ERROR
     # get data loaders
     if args.dataset == "TUAB":
         train_loader, test_loader, val_loader = prepare_TUAB_dataloader(args)
@@ -351,8 +387,7 @@ def supervised(args):
     trainer = pl.Trainer(
         devices=[0],
         accelerator="gpu",
-        strategy=DDPStrategy(find_unused_parameters=False),
-        auto_select_gpus=True,
+        strategy="auto",
         benchmark=True,
         enable_checkpointing=True,
         logger=logger,
@@ -391,7 +426,7 @@ if __name__ == "__main__":
         "--in_channels", type=int, default=16, help="number of input channels"
     )
     parser.add_argument(
-        "--sample_length", type=float, default=10, help="length (s) of sample"
+        "--sample_length", type=int, default=10, help="length (s) of sample"
     )
     parser.add_argument(
         "--n_classes", type=int, default=1, help="number of output classes"
@@ -407,6 +442,30 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pretrain_model_path", type=str, default="", help="pretrained model path"
     )
+    parser.add_argument("--input_dir", type=str, default=None)
+    parser.add_argument("--raw_data_dir", type=str, default=None)
+    parser.add_argument("--result_dir", type=str, default="./seizure-results")
+    parser.add_argument(
+        "--use_fft", action=argparse.BooleanOptionalAction, default=False,
+        help="must remain false for BIOT's raw-input STFT",
+    )
+    parser.add_argument(
+        "--standardize", action=argparse.BooleanOptionalAction, default=True,
+        help="apply explicitly supplied raw TUSZ training scalars",
+    )
+    parser.add_argument("--scaler_mean_path", type=str, default=None)
+    parser.add_argument("--scaler_std_path", type=str, default=None)
+    parser.add_argument("--data_augment", action="store_true")
+    parser.add_argument("--top_k", type=int, default=3)
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--chb_channel_order",
+        choices=("unknown", "biot_process2"),
+        default="unknown",
+        help="only assert biot_process2 when PKLs were made by this repo's process2.py",
+    )
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--max_grad_norm", type=float, default=5.0)
     args = parser.parse_args()
     print(args)
 

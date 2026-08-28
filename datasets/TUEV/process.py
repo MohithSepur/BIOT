@@ -2,6 +2,7 @@ import mne
 import numpy as np
 import os
 import pickle
+import argparse
 from tqdm import tqdm
 
 """
@@ -159,7 +160,9 @@ def save_pickle(object, filename):
 TUEV dataset is downloaded from https://isip.piconepress.com/projects/tuh_eeg/html/downloads.shtml
 """
 
-root = "/srv/local/data/TUH/tuh_eeg_events/v2.0.0/edf"
+parser = argparse.ArgumentParser()
+parser.add_argument("--input_dir", required=True, help="TUEV EDF root")
+root = parser.parse_args().input_dir
 train_out_dir = os.path.join(root, "processed_train")
 eval_out_dir = os.path.join(root, "processed_eval")
 if not os.path.exists(train_out_dir):

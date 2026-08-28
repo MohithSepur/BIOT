@@ -3,15 +3,10 @@ import os
 import numpy as np
 from tqdm import tqdm
 import multiprocessing as mp
+import argparse
 
-root = "/srv/local/data/physionet.org/files/chbmit/1.0.0/clean_signals"
-out = "/srv/local/data/physionet.org/files/chbmit/1.0.0/clean_segments"
-
-# root = 'clean_signals'
-# out = 'clean_segments'
-
-if not os.path.exists(out):
-    os.makedirs(out)
+root = None
+out = None
 
 # dump chb23 and chb24 to test, ch21 and ch22 to val, and the rest to train
 test_pats = ["chb23", "chb24"]
@@ -148,22 +143,29 @@ def sub_to_segments(folder, out_folder):
                 )
 
 
-# parallel parameters
-folders = os.listdir(root)
-out_folders = []
-for folder in folders:
-    if folder in test_pats:
-        out_folder = os.path.join(out, "test")
-    elif folder in val_pats:
-        out_folder = os.path.join(out, "val")
-    else:
-        out_folder = os.path.join(out, "train")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_dir", required=True, help="directory of cleaned recordings")
+    parser.add_argument("--output_dir", required=True, help="destination for existing CHB segmentation")
+    args = parser.parse_args()
 
-    if not os.path.exists(out_folder):
-        os.makedirs(out_folder)
+    global root, out
+    root, out = args.input_dir, args.output_dir
+    os.makedirs(out, exist_ok=True)
+    folders = os.listdir(root)
+    out_folders = []
+    for folder in folders:
+        if folder in test_pats:
+            out_folder = os.path.join(out, "test")
+        elif folder in val_pats:
+            out_folder = os.path.join(out, "val")
+        else:
+            out_folder = os.path.join(out, "train")
+        os.makedirs(out_folder, exist_ok=True)
+        out_folders.append(out_folder)
+    with mp.Pool(mp.cpu_count()) as pool:
+        pool.starmap(sub_to_segments, zip(folders, out_folders))
 
-    out_folders.append(out_folder)
 
-# process in parallel
-with mp.Pool(mp.cpu_count()) as pool:
-    res = pool.starmap(sub_to_segments, zip(folders, out_folders))
+if __name__ == "__main__":
+    main()

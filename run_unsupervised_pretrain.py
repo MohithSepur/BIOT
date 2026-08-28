@@ -10,7 +10,6 @@ import torch.nn.functional as F
 
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 
@@ -95,9 +94,7 @@ def prepare_dataloader(args):
     np.random.seed(seed)
 
     # define the (seizure) data loader
-    root_prest = "/srv/local/data/IIIC_data/5M_IIIC_data/processed/s7n16"
-    root_shhs = "/srv/local/data/SHHS/processed"
-    loader = UnsupervisedPretrainLoader(root_prest, root_shhs)
+    loader = UnsupervisedPretrainLoader(args.prest_root, args.shhs_root)
     train_loader = torch.utils.data.DataLoader(
         loader,
         batch_size=args.batch_size,
@@ -126,15 +123,14 @@ def pretrain(args):
     model = LitModel_supervised_pretrain(args, save_path)
     
     logger = TensorBoardLogger(
-        save_dir="/home/chaoqiy2/github/LEM",
+        save_dir=args.log_dir,
         version=f"{N_version}/checkpoints",
         name="log-pretrain",
     )
     trainer = pl.Trainer(
         devices=[2],
         accelerator="gpu",
-        strategy=DDPStrategy(find_unused_parameters=False),
-        auto_select_gpus=True,
+        strategy="auto",
         benchmark=True,
         enable_checkpointing=True,
         logger=logger,
@@ -152,10 +148,10 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="weight decay")
     parser.add_argument("--batch_size", type=int, default=1024, help="batch size")
     parser.add_argument("--num_workers", type=int, default=32, help="number of workers")
+    parser.add_argument("--prest_root", type=str, required=True)
+    parser.add_argument("--shhs_root", type=str, required=True)
+    parser.add_argument("--log_dir", type=str, default=".")
     args = parser.parse_args()
     print (args)
 
     pretrain(args)
-    
-    
-    

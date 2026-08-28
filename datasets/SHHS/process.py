@@ -71,12 +71,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--multiprocess", type=int, default=30, help="How many processes to use"
     )
+    parser.add_argument("--input_dir", required=True, help="SHHS source root")
     args = parser.parse_args()
 
     if not os.path.exists("./processed/"):
         os.makedirs("./processed/")
 
-    root_folder = "/srv/local/data/SHHS/"
+    root_folder = args.input_dir
 
     N, epoch_sec = args.multiprocess, args.windowsize
     p_list = []

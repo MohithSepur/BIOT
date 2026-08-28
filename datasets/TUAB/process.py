@@ -1,5 +1,6 @@
 import os
 import pickle
+import argparse
 
 from multiprocessing import Pool
 import numpy as np
@@ -140,8 +141,9 @@ if __name__ == "__main__":
     """
     TUAB dataset is downloaded from https://isip.piconepress.com/projects/tuh_eeg/html/downloads.shtml
     """
-    # root to abnormal dataset
-    root = "/srv/local/data/TUH/tuh_eeg_abnormal/v3.0.0/edf/"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_dir", required=True, help="TUAB EDF root")
+    root = parser.parse_args().input_dir
     channel_std = "01_tcp_ar"
 
     # train, val abnormal subjects

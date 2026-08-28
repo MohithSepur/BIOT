@@ -1,5 +1,8 @@
 torch
 numpy
+scipy
+scikit-learn
+pyedflib
 linear_attention_transformer
 einops
 pytorch_lightning

@@ -9,7 +9,6 @@ import torch.nn as nn
 
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pyhealth.metrics import multiclass_metrics_fn
@@ -30,6 +29,8 @@ class LitModel_finetune(pl.LightningModule):
         super().__init__()
         self.args = args
         self.model = model
+        self.validation_outputs = []
+        self.test_outputs = []
 
     def training_step(self, batch, batch_idx):
         X, y = batch
@@ -44,14 +45,15 @@ class LitModel_finetune(pl.LightningModule):
             convScore = self.model(X)
             step_result = convScore.cpu().numpy()
             step_gt = y.cpu().numpy()
-        return step_result, step_gt
+        self.validation_outputs.append((step_result, step_gt))
 
-    def validation_epoch_end(self, val_step_outputs):
+    def on_validation_epoch_end(self):
         result = []
         gt = np.array([])
-        for out in val_step_outputs:
+        for out in self.validation_outputs:
             result.append(out[0])
             gt = np.append(gt, out[1])
+        self.validation_outputs.clear()
 
         result = np.concatenate(result, axis=0)
         result = multiclass_metrics_fn(
@@ -68,14 +70,15 @@ class LitModel_finetune(pl.LightningModule):
             convScore = self.model(X)
             step_result = convScore.cpu().numpy()
             step_gt = y.cpu().numpy()
-        return step_result, step_gt
+        self.test_outputs.append((step_result, step_gt))
 
-    def test_epoch_end(self, test_step_outputs):
+    def on_test_epoch_end(self):
         result = []
         gt = np.array([])
-        for out in test_step_outputs:
+        for out in self.test_outputs:
             result.append(out[0])
             gt = np.append(gt, out[1])
+        self.test_outputs.clear()
 
         result = np.concatenate(result, axis=0)
         result = multiclass_metrics_fn(
@@ -105,7 +108,9 @@ def prepare_TUEV_dataloader(args):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    root = "/srv/local/data/TUH/tuh_eeg_events/v2.0.0/edf"
+    root = args.input_dir
+    if not root:
+        raise ValueError("--input_dir is required for TUEV")
 
     train_files = os.listdir(os.path.join(root, "processed_train"))
     train_sub = list(set([f.split("_")[0] for f in train_files]))
@@ -163,7 +168,9 @@ def prepare_HAR_dataloader(args):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    root = "/srv/local/data/HAR/processed/"
+    root = args.input_dir
+    if not root:
+        raise ValueError("--input_dir is required for HAR")
 
     train_files = os.listdir(os.path.join(root, "train"))
     test_files = os.listdir(os.path.join(root, "test"))
@@ -291,8 +298,7 @@ def supervised(args):
     trainer = pl.Trainer(
         devices=[0],
         accelerator="gpu",
-        strategy=DDPStrategy(find_unused_parameters=False),
-        auto_select_gpus=True,
+        strategy="auto",
         benchmark=True,
         enable_checkpointing=True,
         logger=logger,
@@ -347,6 +353,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pretrain_model_path", type=str, default="", help="pretrained model path"
     )
+    parser.add_argument("--input_dir", type=str, default=None)
     args = parser.parse_args()
     print(args)
 

@@ -9,7 +9,6 @@ import torch.nn as nn
 
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 
@@ -96,7 +95,7 @@ def prepare_dataloader(args):
 
     # for TUEV
     print ("load data from TUEV")
-    tuev_root = "/srv/local/data/TUH/tuh_eeg_events/v2.0.0/edf"
+    tuev_root = args.tuev_root
     
     train_files = os.listdir(os.path.join(tuev_root, "processed_train"))
     train_sub = list(set([f.split("_")[0] for f in train_files]))
@@ -109,7 +108,7 @@ def prepare_dataloader(args):
     
     # for CHB-MIT
     print ("load data from CHB-MIT")
-    chb_mit_root = "/srv/local/data/physionet.org/files/chbmit/1.0.0/clean_segments"
+    chb_mit_root = args.chb_mit_root
     
     train_files = os.listdir(os.path.join(chb_mit_root, "train"))
     print ('train files:', len(train_files))
@@ -118,7 +117,7 @@ def prepare_dataloader(args):
     # for IIIC seizure
     print ("load data from IIIC seizure")
     train_pat_map = pickle.load(
-        open("/home/chaoqiy2/github/LEM/mgh-seizure/data/train_pat_map_seizure.pkl", "rb")
+        open(args.iiic_train_map, "rb")
     )
     train_X, train_Y = [], []
     for i, (_, (X, Y)) in enumerate(train_pat_map.items()):
@@ -132,7 +131,7 @@ def prepare_dataloader(args):
     
     # for TUAB
     print ("load data from TUAB")
-    tuab_root = "/srv/local/data/TUH/tuh_eeg_abnormal/v3.0.0/edf/processed"
+    tuab_root = args.tuab_root
     
     train_files = os.listdir(os.path.join(tuab_root, "train"))
     print ('train files:', len(train_files))
@@ -166,15 +165,14 @@ def pretrain(args):
     model = LitModel_supervised_pretrain(args, save_path)
     
     logger = TensorBoardLogger(
-        save_dir="/home/chaoqiy2/github/LEM",
+        save_dir=args.log_dir,
         version=f"{N_version}/checkpoints",
         name="log-pretrain",
     )
     trainer = pl.Trainer(
         devices=[2],
         accelerator="gpu",
-        strategy=DDPStrategy(find_unused_parameters=False),
-        auto_select_gpus=True,
+        strategy="auto",
         benchmark=True,
         enable_checkpointing=True,
         logger=logger,
@@ -193,10 +191,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=1024, help="batch size")
     parser.add_argument("--num_workers", type=int, default=32, help="number of workers")
     parser.add_argument("--pretrained_model_path", type=str, default="best", help="checkpoint path")
+    parser.add_argument("--tuev_root", type=str, required=True)
+    parser.add_argument("--chb_mit_root", type=str, required=True)
+    parser.add_argument("--tuab_root", type=str, required=True)
+    parser.add_argument("--iiic_train_map", type=str, required=True)
+    parser.add_argument("--log_dir", type=str, default=".")
     args = parser.parse_args()
     print (args)
 
     pretrain(args)
-    
-    
-    
