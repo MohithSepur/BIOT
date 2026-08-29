@@ -444,6 +444,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--input_dir", type=str, default=None)
     parser.add_argument("--raw_data_dir", type=str, default=None)
+    parser.add_argument("--marker_dir", type=str, default="./data/file_markers_detection")
     parser.add_argument("--result_dir", type=str, default="./seizure-results")
     parser.add_argument(
         "--use_fft", action=argparse.BooleanOptionalAction, default=False,

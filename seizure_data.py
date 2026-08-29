@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from math import gcd
 from pathlib import Path
+import h5py
 import pickle
 import random
 
@@ -33,12 +33,6 @@ BIOT_CHB16_CHANNELS = (
     "FP1-F3", "F3-C3", "C3-P3", "P3-O1",
     "FP2-F4", "F4-C4", "C4-P4", "P4-O2",
 )
-MODERN_ALIASES = {
-    "T3": "T7", "T4": "T8", "T5": "P7", "T6": "P8",
-    "T7": "T3", "T8": "T4", "P7": "T5", "P8": "T6",
-}
-
-
 def _require_contract(max_seq_len, time_step_size, use_fft):
     if use_fft:
         raise ValueError("BIOT performs STFT internally and requires use_fft=False")
@@ -72,67 +66,40 @@ def _dynamic_adjacency(eeg_clip, top_k=3):
     return torch.from_numpy(adjacency)
 
 
-def _annotation_path(edf_path):
-    for suffix in (".tse_bi", ".csv_bi", ".tse", ".csv"):
-        candidate = edf_path.with_suffix(suffix)
-        if candidate.exists():
-            return candidate
-    return None
+def _marker_entries(marker_dir, split, clip_len, seed):
+    root = Path(marker_dir)
+    seizure_file = root / f"{split}Set_seq2seq_{clip_len}s_sz.txt"
+    nonseizure_file = root / f"{split}Set_seq2seq_{clip_len}s_nosz.txt"
+    if not seizure_file.exists() or not nonseizure_file.exists():
+        raise FileNotFoundError(f"Missing TUSZ marker files: {seizure_file}, {nonseizure_file}")
+    seizure = [line.strip() for line in seizure_file.read_text().splitlines() if line.strip()]
+    nonseizure = [line.strip() for line in nonseizure_file.read_text().splitlines() if line.strip()]
+    rng = random.Random(seed)
+    if split == "train":
+        rng.shuffle(seizure)
+        rng.shuffle(nonseizure)
+        nonseizure = nonseizure[:len(seizure)]
+    combined = seizure + nonseizure
+    rng.shuffle(combined)
+    return [tuple(item.rsplit(",", 1)) for item in combined]
 
 
-def _seizures_and_end(annotation_path):
-    seizures = []
-    max_time = 0.0
-    with annotation_path.open("r", errors="ignore") as handle:
-        for line in handle:
-            if "version" in line or line.startswith("#") or not line.strip() or "start_time" in line:
-                continue
-            parts = line.strip().replace(",", " ").split()
-            try:
-                if len(parts) >= 4 and parts[0].upper() == "TERM":
-                    start, end, label = float(parts[1]), float(parts[2]), parts[3]
-                elif len(parts) >= 3:
-                    start, end, label = float(parts[0]), float(parts[1]), parts[2]
-                elif len(parts) >= 2 and any(
-                    key in line.lower() for key in ("seiz", "fnsz", "gnsz", "cpsz", "spsz", "tcsz")
-                ):
-                    start, end, label = float(parts[0]), float(parts[1]), "seiz"
-                else:
-                    continue
-            except ValueError:
-                continue
-            max_time = max(max_time, end)
-            if label.lower() != "bckg" or "seiz" in line.lower():
-                seizures.append((start, end))
-    return seizures, max_time
-
-
-def _split_dir(raw_dir, split):
-    if split == "test":
-        for alias in ("eval", "test", "dev"):
-            if (raw_dir / alias).is_dir():
-                return raw_dir / alias
-    candidate = raw_dir / split
-    return candidate if candidate.is_dir() else raw_dir
-
-
-def _ordered_tusz_indices(labels):
-    cleaned = [label.split("-")[0].strip().upper().replace("EEG ", "") for label in labels]
-    indices = []
-    for requested in TUSZ_CHANNELS:
-        name = requested.replace("EEG ", "")
-        candidates = (name, MODERN_ALIASES.get(name, ""))
-        match = next((cleaned.index(item) for item in candidates if item in cleaned), None)
-        if match is None:
-            raise ValueError(f"Required TUSZ channel {requested!r} is absent")
-        indices.append(match)
-    return indices
+def _resampled_path(input_dir, split, marker_name):
+    base_name = marker_name.split(".edf")[0] + ".h5"
+    aliases = ("test", "eval") if split == "test" else (split,)
+    candidates = [Path(input_dir) / alias / base_name for alias in aliases]
+    candidates.append(Path(input_dir) / base_name)
+    match = next((path for path in candidates if path.exists()), None)
+    if match is None:
+        raise FileNotFoundError(f"No resampled HDF5 for {marker_name}; checked {candidates}")
+    return match
 
 
 class TUSZDataset(Dataset):
     def __init__(
         self,
-        raw_data_dir,
+        input_dir,
+        marker_dir,
         split,
         max_seq_len=WINDOW_SECONDS,
         time_step_size=TIME_STEP_SECONDS,
@@ -145,7 +112,10 @@ class TUSZDataset(Dataset):
         use_fft=False,
     ):
         _require_contract(max_seq_len, time_step_size, use_fft)
-        self.raw_data_dir = Path(raw_data_dir)
+        if input_dir is None or marker_dir is None:
+            raise ValueError("input_dir and marker_dir are required for TUSZ")
+        self.input_dir = Path(input_dir)
+        self.marker_dir = Path(marker_dir)
         self.max_seq_len = int(max_seq_len)
         self.time_step_size = int(time_step_size)
         self.standardize = standardize
@@ -155,61 +125,43 @@ class TUSZDataset(Dataset):
             raise ValueError("std must be non-zero")
         self.data_augment = data_augment
         self.top_k = top_k
-        positive, negative = [], []
-        for edf_path in sorted(_split_dir(self.raw_data_dir, split).rglob("*.edf")):
-            annotation = _annotation_path(edf_path)
-            if annotation is None:
-                continue
-            seizures, max_time = _seizures_and_end(annotation)
-            for clip_index in range(int(max_time // self.max_seq_len)):
-                start = clip_index * self.max_seq_len
-                end = (clip_index + 1) * self.max_seq_len
-                label = int(any(max(start, onset) < min(end, offset) for onset, offset in seizures))
-                entry = (edf_path, clip_index, label, f"{edf_path.name}_{clip_index}")
-                (positive if label else negative).append(entry)
-        rng = random.Random(seed)
-        if split == "train":
-            rng.shuffle(positive)
-            rng.shuffle(negative)
-            negative = negative[:len(positive)]
-        self.entries = positive + negative
-        rng.shuffle(self.entries)
+        self.entries = []
+        for marker_name, label_text in _marker_entries(self.marker_dir, split, self.max_seq_len, seed):
+            clip_index = int(marker_name.rsplit("_", 1)[1].split(".h5")[0])
+            self.entries.append(
+                (_resampled_path(self.input_dir, split, marker_name), clip_index,
+                 int(label_text), marker_name.split(".h5")[0])
+            )
         self.num_nodes = len(TUSZ_CHANNELS)
         self.channel_names = TUSZ_CHANNELS
         self.channel_order_verified = True
-        self.pos_weight = None
+        sample = self.entries[:min(3000, len(self.entries))]
+        positives = sum(label == 1 for _, _, label, _ in sample)
+        negatives = len(sample) - positives
+        self.pos_weight = float(negatives) / positives if positives else 260.0
 
     def __len__(self):
         return len(self.entries)
 
-    def _read_window(self, edf_path, clip_index):
-        import pyedflib
-
-        reader = pyedflib.EdfReader(str(edf_path))
-        try:
-            indices = _ordered_tusz_indices(list(reader.getSignalLabels()))
-            original_frequency = int(round(reader.getSampleFrequency(0)))
-            signal = np.stack([reader.readSignal(index) for index in indices]).astype(np.float32)
-        finally:
-            reader.close()
-        if original_frequency != FREQUENCY:
-            common = gcd(original_frequency, FREQUENCY)
-            signal = resample_poly(
-                signal, FREQUENCY // common, original_frequency // common, axis=-1
-            ).astype(np.float32)
+    def _read_window(self, h5_path, clip_index):
         length = self.max_seq_len * FREQUENCY
         start = clip_index * length
-        window = signal[:, start:start + length]
+        with h5py.File(h5_path, "r") as handle:
+            if int(handle["resample_freq"][()]) != FREQUENCY:
+                raise ValueError(f"Unexpected resample frequency in {h5_path}")
+            window = handle["resampled_signal"][:, start:start + length]
+        if window.shape[0] != self.num_nodes:
+            raise ValueError(f"Expected {self.num_nodes} TUSZ channels, got {window.shape[0]}")
         if window.shape[-1] < length:
             if window.shape[-1] == 0:
-                raise ValueError(f"Empty TUSZ window {edf_path.name}:{clip_index}")
+                raise ValueError(f"Empty TUSZ window {h5_path.name}:{clip_index}")
             window = np.pad(window, ((0, 0), (0, length - window.shape[-1])), mode="edge")
         step = self.time_step_size * FREQUENCY
         return np.stack([window[:, offset:offset + step] for offset in range(0, length, step)])
 
     def __getitem__(self, index):
-        edf_path, clip_index, label, writeout_fn = self.entries[index]
-        eeg_clip = self._read_window(edf_path, clip_index)
+        h5_path, clip_index, label, writeout_fn = self.entries[index]
+        eeg_clip = self._read_window(h5_path, clip_index)
         feature = eeg_clip.copy()
         if self.data_augment:
             pairs = ((0, 1), (2, 3), (10, 11), (4, 5), (12, 13), (14, 15), (8, 9))
@@ -362,7 +314,8 @@ def build_seizure_dataloaders(args):
     for split in ("train", "dev", "test"):
         if args.dataset == "TUSZ":
             dataset = TUSZDataset(
-                args.raw_data_dir,
+                args.input_dir,
+                args.marker_dir,
                 split,
                 max_seq_len=args.sample_length,
                 standardize=args.standardize,

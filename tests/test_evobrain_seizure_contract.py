@@ -10,6 +10,8 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from model.biot import BIOTClassifier
+from generate_markers import generate_markers_tusz
+from resample_signals import TUSZ_CHANNELS, process_single_file
 from seizure_data import (
     BIOT_CHB16_CHANNELS,
     CHBMITPklDataset,
@@ -85,6 +87,20 @@ class _ChannelDataset:
         self.num_nodes = channels
         self.channel_names = names
         self.channel_order_verified = verified
+
+
+class _FakeEDF:
+    def getSignalLabels(self):
+        return [f"{name}-REF" for name in TUSZ_CHANNELS]
+
+    def getSampleFrequency(self, _):
+        return 250
+
+    def readSignal(self, index):
+        return np.arange(6250, dtype=np.float32) + index
+
+    def close(self):
+        pass
 
 
 class EvoBrainContractTest(unittest.TestCase):
@@ -190,19 +206,28 @@ class EvoBrainContractTest(unittest.TestCase):
 
     def test_tusz_index_and_fft_rejection(self):
         with tempfile.TemporaryDirectory() as directory:
-            raw_dir = Path(directory) / "dev"
-            raw_dir.mkdir()
-            (raw_dir / "record.edf").touch()
-            (raw_dir / "record.tse").write_text(
-                "0 5 bckg\n5 8 fnsz\n8 25 bckg\n", encoding="utf-8"
+            root = Path(directory)
+            raw_root, marker_dir, input_dir = root / "raw", root / "markers", root / "resampled"
+            for split in ("train", "dev", "test"):
+                split_dir = raw_root / split
+                split_dir.mkdir(parents=True)
+                (split_dir / "record.edf").touch()
+                (split_dir / "record.tse").write_text(
+                    "0 5 bckg\n5 8 fnsz\n8 25 bckg\n", encoding="utf-8"
+                )
+            generate_markers_tusz(raw_root, marker_dir, 10)
+            process_single_file(
+                raw_root / "dev" / "record.edf", raw_root, input_dir,
+                reader_factory=lambda _: _FakeEDF(),
             )
             dataset = TUSZDataset(
-                directory, "dev", standardize=False, use_fft=False
+                input_dir, marker_dir, "dev", standardize=False, use_fft=False
             )
             indexed = sorted((clip, label) for _, clip, label, _ in dataset.entries)
             self.assertEqual(indexed, [(0, 1), (1, 0)])
+            self.assertEqual(dataset[0][0].shape, (10, 19, 200))
             with self.assertRaisesRegex(ValueError, "use_fft=False"):
-                TUSZDataset(directory, "dev", standardize=False, use_fft=True)
+                TUSZDataset(input_dir, marker_dir, "dev", standardize=False, use_fft=True)
 
     def test_eval_is_unweighted_and_dev_threshold_is_reused(self):
         self.assertIsNone(evaluation_criterion(torch.device("cpu")).pos_weight)
