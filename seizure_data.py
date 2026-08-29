@@ -13,6 +13,11 @@ from scipy.signal import resample_poly
 from torch.utils.data import DataLoader, Dataset
 
 
+def pin_memory_enabled():
+    """Pin batches only for the automatically selected CUDA execution path."""
+    return torch.cuda.is_available()
+
+
 # Mirrored from EvoBrain/constants.py:2-32 and args.py:67-79.
 FREQUENCY = 200
 WINDOW_SECONDS = 10
@@ -384,6 +389,6 @@ def build_seizure_dataloaders(args):
             batch_size=args.batch_size,
             shuffle=split == "train",
             num_workers=args.num_workers,
-            pin_memory=torch.cuda.is_available(),
+            pin_memory=pin_memory_enabled(),
         )
     return loaders

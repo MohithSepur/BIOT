@@ -1,6 +1,7 @@
 import pickle
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,7 +10,12 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from model.biot import BIOTClassifier
-from seizure_data import BIOT_CHB16_CHANNELS, CHBMITPklDataset, TUSZDataset
+from seizure_data import (
+    BIOT_CHB16_CHANNELS,
+    CHBMITPklDataset,
+    TUSZDataset,
+    pin_memory_enabled,
+)
 from seizure_model import (
     BIOTSeizureModel,
     BIOTSeizureOutput,
@@ -18,8 +24,10 @@ from seizure_model import (
     checkpoint_channel_count,
 )
 from seizure_training import (
+    configure_amp,
     evaluate_and_save,
     evaluation_criterion,
+    resolve_device,
     smoothed_pos_weight,
     train_one_batch,
     training_criterion,
@@ -80,6 +88,17 @@ class _ChannelDataset:
 
 
 class EvoBrainContractTest(unittest.TestCase):
+    def test_cuda_available_device_amp_and_pin_memory_branches(self):
+        with patch("torch.cuda.is_available", return_value=True):
+            device = resolve_device()
+            use_amp, scaler = configure_amp(device, requested=True)
+            self.assertEqual(device.type, "cuda")
+            self.assertTrue(use_amp)
+            self.assertTrue(scaler.is_enabled())
+            self.assertTrue(pin_memory_enabled())
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                pass
+
     def test_actual_biot_forward_backward_optimizer_step(self):
         torch.manual_seed(123)
         backbone = BIOTClassifier(
