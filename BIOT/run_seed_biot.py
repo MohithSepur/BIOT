@@ -27,6 +27,7 @@ from seed_data import (
     SeedBIOTDataset,
     class_counts,
     discover_seed_windows,
+    prepare_seed_cache,
     split_seed_windows,
 )
 from seed_model import build_seed_biot
@@ -178,6 +179,20 @@ def parse_args():
     parser.add_argument("--source-sampling-rate", type=int, default=200)
     parser.add_argument("--window-seconds", type=float, default=10.0)
     parser.add_argument("--stride-seconds", type=float, default=10.0)
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Shared trial cache (default: DATA_DIR/.biot_seed_cache_v1)",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Read compressed MAT trials directly (substantially slower)",
+    )
+    parser.add_argument(
+        "--rebuild-cache", action="store_true", help="Regenerate all cached trials"
+    )
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument(
         "--pretrained", action=argparse.BooleanOptionalAction, default=True
@@ -187,6 +202,12 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=4,
+        help="Batches queued per DataLoader worker",
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument(
@@ -205,6 +226,8 @@ def main():
     args = parse_args()
     if args.epochs <= 0 or args.batch_size <= 0 or args.num_workers < 0:
         raise ValueError("epochs/batch-size must be positive and num-workers non-negative")
+    if args.prefetch_factor <= 0:
+        raise ValueError("prefetch-factor must be positive")
     if args.max_grad_norm < 0:
         raise ValueError("max-grad-norm must be non-negative")
     seed_everything(args.seed)
@@ -219,15 +242,39 @@ def main():
         window_seconds=args.window_seconds,
         stride_seconds=args.stride_seconds,
     )
+    cache_dir = None
+    cache_report = None
+    if not args.no_cache:
+        cache_dir = (
+            args.cache_dir.expanduser().resolve()
+            if args.cache_dir is not None
+            else args.data_dir.expanduser().resolve() / ".biot_seed_cache_v1"
+        )
+        cache_report = prepare_seed_cache(
+            windows,
+            cache_dir,
+            source_sampling_rate=args.source_sampling_rate,
+            rebuild=args.rebuild_cache,
+        )
+        print(f"Trial cache: {cache_dir} ({cache_report})")
     split = split_seed_windows(windows, args.test_subject, args.dev_subject)
     datasets = {
         name: SeedBIOTDataset(
             values,
             source_sampling_rate=args.source_sampling_rate,
             target_sampling_rate=200,
+            cache_dir=cache_dir,
         )
         for name, values in split.items()
     }
+    loader_worker_options = (
+        {
+            "persistent_workers": True,
+            "prefetch_factor": args.prefetch_factor,
+        }
+        if args.num_workers > 0
+        else {}
+    )
     loaders = {
         name: DataLoader(
             dataset,
@@ -235,7 +282,7 @@ def main():
             shuffle=name == "train",
             num_workers=args.num_workers,
             pin_memory=device.type == "cuda",
-            persistent_workers=args.num_workers > 0,
+            **loader_worker_options,
         )
         for name, dataset in datasets.items()
     }
@@ -262,6 +309,8 @@ def main():
         label_file=str(args.label_file) if args.label_file else None,
         output_dir=str(output_dir),
         checkpoint=str(checkpoint) if checkpoint else None,
+        cache_dir=str(cache_dir) if cache_dir else None,
+        cache_report=cache_report,
         model_report=model_report,
         class_counts=counts,
     )

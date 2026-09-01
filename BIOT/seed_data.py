@@ -10,9 +10,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import hashlib
+import json
 from math import gcd
+import os
 from pathlib import Path
 import re
+import tempfile
 from typing import Iterable
 
 import numpy as np
@@ -20,6 +24,7 @@ from scipy.io import loadmat, whosmat
 from scipy.signal import resample_poly
 import torch
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 
 SEED_CHANNELS = (
@@ -177,12 +182,143 @@ def to_biot_prest16(monopolar: np.ndarray) -> np.ndarray:
     )
 
 
+def _cache_key(path: Path, variable: str) -> str:
+    identity = f"{path.name}\0{variable}".encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()[:16]
+    safe_variable = re.sub(r"[^A-Za-z0-9_.-]+", "_", variable)
+    return f"{path.stem}__{safe_variable}__{digest}"
+
+
+def _cache_paths(cache_dir: Path, path: Path, variable: str) -> tuple[Path, Path]:
+    stem = _cache_key(path, variable)
+    return cache_dir / f"{stem}.npy", cache_dir / f"{stem}.json"
+
+
+def _cache_metadata(
+    path: Path,
+    variable: str,
+    source_sampling_rate: int,
+) -> dict[str, object]:
+    stat = path.stat()
+    return {
+        "format_version": 1,
+        "source_file": str(path.resolve()),
+        "source_size": stat.st_size,
+        "source_mtime_ns": stat.st_mtime_ns,
+        "variable": variable,
+        "source_sampling_rate": source_sampling_rate,
+        "channels": list(BIOT_PREST16_CHANNELS),
+        "dtype": "float32",
+    }
+
+
+def _valid_cache(array_path: Path, metadata_path: Path, expected: dict[str, object]) -> bool:
+    if not array_path.is_file() or not metadata_path.is_file():
+        return False
+    try:
+        with metadata_path.open("r", encoding="utf-8") as handle:
+            actual = json.load(handle)
+        if actual != expected:
+            return False
+        array = np.load(array_path, mmap_mode="r", allow_pickle=False)
+        return array.ndim == 2 and array.shape[0] == len(BIOT_PREST16_CHANNELS)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _atomic_save_array(path: Path, array: np.ndarray) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            np.save(handle, np.ascontiguousarray(array, dtype=np.float32), allow_pickle=False)
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _atomic_save_json(path: Path, content: dict[str, object]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", text=True
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(content, handle, sort_keys=True)
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def prepare_seed_cache(
+    windows: Iterable[SeedWindow],
+    cache_dir: Path,
+    source_sampling_rate: int = 200,
+    rebuild: bool = False,
+) -> dict[str, int]:
+    """Materialize each MAT trial once as a memory-mappable BIOT montage."""
+    if source_sampling_rate <= 0:
+        raise ValueError("source_sampling_rate must be positive")
+    cache_dir = Path(cache_dir).expanduser().resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    trials = {
+        (reference.mat_path.resolve(), reference.variable)
+        for reference in windows
+    }
+    created = 0
+    reused = 0
+    for mat_path, variable in tqdm(
+        sorted(trials, key=lambda item: (str(item[0]), item[1])),
+        desc="Preparing SEED trial cache",
+        unit="trial",
+        dynamic_ncols=True,
+    ):
+        array_path, metadata_path = _cache_paths(cache_dir, mat_path, variable)
+        metadata = _cache_metadata(mat_path, variable, source_sampling_rate)
+        if not rebuild and _valid_cache(array_path, metadata_path, metadata):
+            reused += 1
+            continue
+        # Do not populate the direct-loader LRU while building hundreds of
+        # trials; retaining several full 62-channel MAT arrays wastes memory.
+        trial = np.asarray(_read_trial(str(mat_path), variable), dtype=np.float32)
+        if not np.isfinite(trial).all():
+            raise ValueError(f"Non-finite EEG in {mat_path}:{variable}")
+        # Cache at the source rate. Resampling is deliberately still done after
+        # window slicing so filter-boundary behavior matches uncached loading.
+        transformed = to_biot_prest16(trial)
+        if not np.isfinite(transformed).all():
+            raise ValueError(f"Non-finite cached EEG in {mat_path}:{variable}")
+        _atomic_save_array(array_path, transformed)
+        _atomic_save_json(metadata_path, metadata)
+        created += 1
+    _load_trial.cache_clear()
+    _load_cached_trial.cache_clear()
+    return {"trials": len(trials), "created": created, "reused": reused}
+
+
 @lru_cache(maxsize=4)
 def _load_trial(path: str, variable: str) -> np.ndarray:
+    return _read_trial(path, variable)
+
+
+def _read_trial(path: str, variable: str) -> np.ndarray:
     content = loadmat(path, variable_names=[variable])
     if variable not in content:
         raise KeyError(f"{path} has no variable {variable!r}")
     return np.asarray(content[variable])
+
+
+@lru_cache(maxsize=32)
+def _load_cached_trial(path: str) -> np.ndarray:
+    return np.load(path, mmap_mode="r", allow_pickle=False)
 
 
 class SeedBIOTDataset(Dataset):
@@ -192,26 +328,59 @@ class SeedBIOTDataset(Dataset):
         source_sampling_rate: int = 200,
         target_sampling_rate: int = 200,
         normalize: bool = True,
+        cache_dir: Path | None = None,
     ):
         self.windows = list(windows)
         self.source_sampling_rate = int(source_sampling_rate)
         self.target_sampling_rate = int(target_sampling_rate)
         self.normalize = normalize
+        self.cache_dir = (
+            Path(cache_dir).expanduser().resolve() if cache_dir is not None else None
+        )
         if self.source_sampling_rate <= 0 or self.target_sampling_rate <= 0:
             raise ValueError("sampling rates must be positive")
+        self._cached_paths: dict[tuple[Path, str], Path] = {}
+        if self.cache_dir is not None:
+            for reference in self.windows:
+                key = (reference.mat_path.resolve(), reference.variable)
+                if key in self._cached_paths:
+                    continue
+                array_path, metadata_path = _cache_paths(
+                    self.cache_dir, reference.mat_path, reference.variable
+                )
+                expected = _cache_metadata(
+                    reference.mat_path,
+                    reference.variable,
+                    self.source_sampling_rate,
+                )
+                if not _valid_cache(array_path, metadata_path, expected):
+                    raise RuntimeError(
+                        f"Missing or stale SEED cache for {reference.mat_path}:"
+                        f"{reference.variable}; run prepare_seed_cache first"
+                    )
+                self._cached_paths[key] = array_path
 
     def __len__(self) -> int:
         return len(self.windows)
 
     def __getitem__(self, index: int):
         reference = self.windows[index]
-        trial = _load_trial(str(reference.mat_path), reference.variable)
-        clip = np.asarray(
-            trial[:, reference.start_sample:reference.stop_sample], dtype=np.float32
-        )
+        if self.cache_dir is None:
+            trial = _load_trial(str(reference.mat_path), reference.variable)
+            clip = np.asarray(
+                trial[:, reference.start_sample:reference.stop_sample], dtype=np.float32
+            )
+        else:
+            key = (reference.mat_path.resolve(), reference.variable)
+            array_path = self._cached_paths[key]
+            trial = _load_cached_trial(str(array_path))
+            clip = np.asarray(
+                trial[:, reference.start_sample:reference.stop_sample], dtype=np.float32
+            )
         if not np.isfinite(clip).all():
             raise ValueError(f"Non-finite EEG in {reference.writeout_fn}")
-        clip = to_biot_prest16(clip)
+        if self.cache_dir is None:
+            clip = to_biot_prest16(clip)
 
         if self.source_sampling_rate != self.target_sampling_rate:
             common = gcd(self.source_sampling_rate, self.target_sampling_rate)

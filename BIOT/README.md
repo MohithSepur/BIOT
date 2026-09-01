@@ -25,6 +25,15 @@ python run_seed_biot.py \
   --device auto
 ```
 
+On the first run, the loader creates a resumable cache at
+`DATA_DIR/.biot_seed_cache_v1`. Each compressed MAT trial is read once and its
+16-channel BIOT montage is stored as a float32, memory-mappable NumPy array.
+Later epochs and subject folds reuse the cache instead of repeatedly
+decompressing MAT trials. Use `--cache-dir /shared/path` to choose another
+location, `--rebuild-cache` to refresh it, or `--no-cache` for direct MAT
+loading. Window slicing, resampling, and per-window normalization are identical
+with and without the cache.
+
 The source sampling rate defaults to 200 Hz and must match the actual MAT files.
 BIOT receives raw time-domain `[batch, 16, time]` tensors and performs its STFT
 internally. The task uses a three-logit cross-entropy head; no seizure-specific

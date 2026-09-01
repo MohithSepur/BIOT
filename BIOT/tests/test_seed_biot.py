@@ -11,6 +11,7 @@ from seed_data import (
     SEED_CHANNELS,
     SeedBIOTDataset,
     discover_seed_windows,
+    prepare_seed_cache,
     split_seed_windows,
     to_biot_prest16,
 )
@@ -102,6 +103,53 @@ class SeedBIOTTest(unittest.TestCase):
                 )
             )
             optimizer.step()
+
+    def test_trial_cache_preserves_output_and_is_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._make_seed(root)
+            windows = discover_seed_windows(
+                root,
+                source_sampling_rate=200,
+                window_seconds=2,
+                stride_seconds=2,
+            )
+            cache_dir = root / "cache"
+            first = prepare_seed_cache(windows, cache_dir)
+            second = prepare_seed_cache(windows, cache_dir)
+            self.assertEqual(first, {"trials": 9, "created": 9, "reused": 0})
+            self.assertEqual(second, {"trials": 9, "created": 0, "reused": 9})
+
+            uncached = SeedBIOTDataset(windows[:1], normalize=True)[0]
+            cached = SeedBIOTDataset(
+                windows[:1], normalize=True, cache_dir=cache_dir
+            )[0]
+            torch.testing.assert_close(cached[0], uncached[0], rtol=0, atol=0)
+            self.assertEqual(cached[1].item(), uncached[1].item())
+            self.assertEqual(cached[2], uncached[2])
+
+            resampled_cache = root / "resampled-cache"
+            prepare_seed_cache(
+                windows,
+                resampled_cache,
+                source_sampling_rate=200,
+            )
+            uncached_resampled = SeedBIOTDataset(
+                windows[:1],
+                source_sampling_rate=200,
+                target_sampling_rate=100,
+                normalize=True,
+            )[0]
+            cached_resampled = SeedBIOTDataset(
+                windows[:1],
+                source_sampling_rate=200,
+                target_sampling_rate=100,
+                normalize=True,
+                cache_dir=resampled_cache,
+            )[0]
+            torch.testing.assert_close(
+                cached_resampled[0], uncached_resampled[0], rtol=0, atol=0
+            )
 
 
 if __name__ == "__main__":
