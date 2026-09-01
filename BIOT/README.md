@@ -7,6 +7,31 @@
 
 **[Applications]** Our model can be used for standard supervised learning, supervised learning with missing values, (supervised and unsupervised) pre-training on multiple data sources with different formats and fine-tuning on similar new datasets.
 
+## SEED three-class emotion recognition
+
+`run_seed_biot.py` adds an isolated, subject-independent SEED fine-tuning path
+without changing BIOT's backbone. It reads the standard `Preprocessed_EEG` MAT
+files and `label.mat`, cuts complete fixed-length windows, and derives the exact
+16 bipolar channels expected by `EEG-PREST-16-channels.ckpt` from SEED's 62
+monopolar electrodes. Test and development subjects must be declared explicitly;
+all remaining subjects form the training split.
+
+```bash
+python run_seed_biot.py \
+  --data-dir /path/to/SEED/Preprocessed_EEG \
+  --output-dir ./results/seed/test_subject_1 \
+  --test-subject 1 \
+  --dev-subject 2 \
+  --device auto
+```
+
+The source sampling rate defaults to 200 Hz and must match the actual MAT files.
+BIOT receives raw time-domain `[batch, 16, time]` tensors and performs its STFT
+internally. The task uses a three-logit cross-entropy head; no seizure-specific
+batch contract, FFT input, binary class weight, or threshold is used. Final dev
+and test artifacts preserve window identifiers in `dev_results.npz` and
+`test_results.npz`.
+
 <p align="center">
     <img src="fig/bst.jpg" width="800">
 </p>    
