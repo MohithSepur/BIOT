@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import pickle
 import random
 import time
 
@@ -172,6 +173,34 @@ def metric_log(metrics):
     return json.dumps(printable, sort_keys=True)
 
 
+def save_run_checkpoint(path: Path, model: nn.Module, epoch: int, dev_macro_f1: float):
+    """Save only tensors and built-in scalar metadata for restricted loading."""
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "epoch": int(epoch),
+            "dev_macro_f1": float(dev_macro_f1),
+        },
+        path,
+    )
+
+
+def load_run_checkpoint(path: Path):
+    """Load current checkpoints and safely recover our legacy NumPy metadata."""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except pickle.UnpicklingError:
+        # Older versions of this runner saved sklearn's np.float64 F1 value.
+        # Allow only NumPy scalar/dtype constructors, never arbitrary globals.
+        try:
+            from numpy._core.multiarray import scalar as numpy_scalar
+        except ImportError:  # NumPy 1.x
+            from numpy.core.multiarray import scalar as numpy_scalar
+        safe_types = [numpy_scalar, np.dtype, type(np.dtype(np.float64))]
+        with torch.serialization.safe_globals(safe_types):
+            return torch.load(path, map_location="cpu", weights_only=True)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune BIOT on three-class SEED")
     parser.add_argument("--data-dir", type=Path, required=True)
@@ -232,6 +261,11 @@ def parse_args():
         help="Optional gradient clipping; 0 disables clipping (default)",
     )
     parser.add_argument("--max-patience", type=int, default=7)
+    parser.add_argument(
+        "--evaluate-only",
+        action="store_true",
+        help="Skip training and evaluate OUTPUT_DIR/best_model.pt",
+    )
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
@@ -362,35 +396,39 @@ def main():
     best_epoch = 0
     patience = 0
     start_time = time.time()
-    for epoch in range(1, args.epochs + 1):
-        train_loss, skipped = train_epoch(
-            model,
-            loaders["train"],
-            train_criterion,
-            optimizer,
-            device,
-            epoch,
-            args.max_grad_norm,
-        )
-        dev_metrics, *_ = evaluate(model, loaders["dev"], eval_criterion, device)
-        print(
-            f"Epoch {epoch}: train_loss={train_loss:.6f}, skipped={skipped}, "
-            f"dev={metric_log(dev_metrics)}"
-        )
-        if dev_metrics["macro_f1"] > best_f1:
-            best_f1 = dev_metrics["macro_f1"]
-            best_epoch = epoch
-            patience = 0
-            torch.save(
-                {"model": model.state_dict(), "epoch": epoch, "dev_macro_f1": best_f1},
-                output_dir / "best_model.pt",
+    checkpoint_path = output_dir / "best_model.pt"
+    if not args.evaluate_only:
+        for epoch in range(1, args.epochs + 1):
+            train_loss, skipped = train_epoch(
+                model,
+                loaders["train"],
+                train_criterion,
+                optimizer,
+                device,
+                epoch,
+                args.max_grad_norm,
             )
-        else:
-            patience += 1
-            if patience >= args.max_patience:
-                break
+            dev_metrics, *_ = evaluate(model, loaders["dev"], eval_criterion, device)
+            print(
+                f"Epoch {epoch}: train_loss={train_loss:.6f}, skipped={skipped}, "
+                f"dev={metric_log(dev_metrics)}"
+            )
+            dev_macro_f1 = float(dev_metrics["macro_f1"])
+            if dev_macro_f1 > best_f1:
+                best_f1 = dev_macro_f1
+                best_epoch = epoch
+                patience = 0
+                save_run_checkpoint(checkpoint_path, model, epoch, best_f1)
+            else:
+                patience += 1
+                if patience >= args.max_patience:
+                    break
+    elif not checkpoint_path.is_file():
+        raise FileNotFoundError(f"No checkpoint to evaluate: {checkpoint_path}")
 
-    best = torch.load(output_dir / "best_model.pt", map_location="cpu", weights_only=True)
+    best = load_run_checkpoint(checkpoint_path)
+    best_epoch = int(best["epoch"])
+    best_f1 = float(best["dev_macro_f1"])
     model.load_state_dict(best["model"])
     model.to(device)
     for split_name in ("dev", "test"):

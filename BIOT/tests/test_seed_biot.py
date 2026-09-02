@@ -21,6 +21,7 @@ from seed_data import (
     to_biot_prest16,
 )
 from seed_model import build_seed_biot
+from run_seed_biot import load_run_checkpoint, save_run_checkpoint
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -253,6 +254,29 @@ class SeedBIOTTest(unittest.TestCase):
                 optimizer.step()
             finally:
                 seed_data.lmdb = original_lmdb
+
+    def test_checkpoint_metadata_and_legacy_numpy_scalar_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model = torch.nn.Linear(2, 1)
+            current_path = root / "current.pt"
+            save_run_checkpoint(current_path, model, 3, np.float64(0.625))
+            current = load_run_checkpoint(current_path)
+            self.assertIs(type(current["epoch"]), int)
+            self.assertIs(type(current["dev_macro_f1"]), float)
+
+            legacy_path = root / "legacy.pt"
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "epoch": 12,
+                    "dev_macro_f1": np.float64(0.6849694153919729),
+                },
+                legacy_path,
+            )
+            legacy = load_run_checkpoint(legacy_path)
+            self.assertEqual(legacy["epoch"], 12)
+            self.assertAlmostEqual(float(legacy["dev_macro_f1"]), 0.6849694153919729)
 
 
 if __name__ == "__main__":
