@@ -10,20 +10,26 @@
 ## SEED three-class emotion recognition
 
 `run_seed_biot.py` adds an isolated, subject-independent SEED fine-tuning path
-without changing BIOT's backbone. It reads the standard `Preprocessed_EEG` MAT
-files and `label.mat`, cuts complete fixed-length windows, and derives the exact
-16 bipolar channels expected by `EEG-PREST-16-channels.ckpt` from SEED's 62
-monopolar electrodes. Test and development subjects must be declared explicitly;
-all remaining subjects form the training split.
+without changing BIOT's backbone. Its primary input is the supplied processed
+LMDB directory containing `data.mdb`, `lock.mdb`, and `subject_split.json`. It
+uses the `train`/`val`/`test` lists stored in LMDB's `__keys__` record without
+reshuffling subjects. Ten consecutive one-second records from the same session
+and trial become one 10-second example; incomplete tails and sequences with gaps
+are not padded or joined across trials. The loader derives the exact 16 bipolar
+channels expected by `EEG-PREST-16-channels.ckpt` from the stored 62 monopolar
+channels.
 
 ```bash
 python run_seed_biot.py \
-  --data-dir /path/to/SEED/Preprocessed_EEG \
-  --output-dir ./results/seed/test_subject_1 \
-  --test-subject 1 \
-  --dev-subject 2 \
+  --data-dir /path/to/SEED/processed \
+  --output-dir ./results/seed/lmdb_split \
   --device auto
 ```
+
+LMDB records are pickled by the supplied preprocessing script, so only load a
+database you created or otherwise trust. No additional cache is built for LMDB.
+The older MAT path remains available with `--data-format mat`; it requires
+`--test-subject` and `--dev-subject` and can use the trial cache described below.
 
 On the first run, the loader creates a resumable cache at
 `DATA_DIR/.biot_seed_cache_v1`. Each compressed MAT trial is read once and its

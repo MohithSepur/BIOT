@@ -15,6 +15,7 @@ import json
 from math import gcd
 import os
 from pathlib import Path
+import pickle
 import re
 import tempfile
 from typing import Iterable
@@ -25,6 +26,11 @@ from scipy.signal import resample_poly
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
+
+try:
+    import lmdb
+except ImportError:  # MAT loading remains usable without the optional LMDB binding.
+    lmdb = None
 
 
 SEED_CHANNELS = (
@@ -48,6 +54,9 @@ BIOT_PREST16_CHANNELS = tuple(f"{left}-{right}" for left, right in BIOT_PREST16_
 _CHANNEL_INDEX = {name: index for index, name in enumerate(SEED_CHANNELS)}
 _TRIAL_PATTERN = re.compile(r"(?:^|_)eeg(?P<trial>\d+)$", re.IGNORECASE)
 _RECORDING_PATTERN = re.compile(r"^(?P<subject>\d+)_(?P<session>.+)$")
+_LMDB_KEY_PATTERN = re.compile(
+    r"^(?P<recording>.+\.mat)-(?P<trial>\d+)-(?P<segment>\d+)$"
+)
 
 
 @dataclass(frozen=True)
@@ -66,6 +75,25 @@ class SeedWindow:
         return (
             f"sub{self.subject:02d}_{self.session}_trial{self.trial:02d}_"
             f"{self.start_sample:08d}-{self.stop_sample:08d}"
+        )
+
+
+@dataclass(frozen=True)
+class SeedLMDBWindow:
+    keys: tuple[str, ...]
+    split: str
+    recording: str
+    subject: int
+    trial: int
+    start_segment: int
+    stop_segment: int
+    label: int
+
+    @property
+    def writeout_fn(self) -> str:
+        return (
+            f"{Path(self.recording).stem}_trial{self.trial:02d}_"
+            f"segments{self.start_segment:06d}-{self.stop_segment:06d}"
         )
 
 
@@ -170,6 +198,191 @@ def split_seed_windows(
     if any(not values for values in split.values()):
         raise ValueError("Every split must contain at least one window")
     return split
+
+
+def _require_lmdb() -> None:
+    if lmdb is None:
+        raise ModuleNotFoundError(
+            "SEED data.mdb loading requires the small 'lmdb' Python package. "
+            "Install it in the environment used to launch run_seed_biot.py."
+        )
+
+
+def is_seed_lmdb(data_dir: Path) -> bool:
+    return (Path(data_dir).expanduser() / "data.mdb").is_file()
+
+
+def _decode_lmdb_record(raw: bytes | None, key: str) -> tuple[np.ndarray, int]:
+    if raw is None:
+        raise KeyError(f"LMDB record is missing: {key}")
+    # The supplied preprocessing script deliberately writes trusted pickle
+    # dictionaries. Never point this loader at an untrusted LMDB.
+    record = pickle.loads(raw)
+    if not isinstance(record, dict) or "sample" not in record or "label" not in record:
+        raise ValueError(f"LMDB record {key!r} is not a sample/label dictionary")
+    sample = np.asarray(record["sample"])
+    label = int(record["label"])
+    if sample.shape != (len(SEED_CHANNELS), 1, 200):
+        raise ValueError(
+            f"LMDB record {key!r} has shape {sample.shape}; expected (62, 1, 200)"
+        )
+    if label not in (0, 1, 2):
+        raise ValueError(f"LMDB record {key!r} has invalid label {label}; expected 0, 1, or 2")
+    return sample, label
+
+
+def _subject_from_recording(recording: str) -> int:
+    token = Path(recording).name.split("_", 1)[0]
+    if not token.isdigit():
+        raise ValueError(
+            f"Cannot extract SEED subject from LMDB recording name {recording!r}"
+        )
+    return int(token)
+
+
+def discover_seed_lmdb_windows(
+    data_dir: Path,
+    window_seconds: float = 10.0,
+    stride_seconds: float = 10.0,
+) -> dict[str, list[SeedLMDBWindow]]:
+    """Read the stored split and group consecutive one-second LMDB entries."""
+    _require_lmdb()
+    data_dir = Path(data_dir).expanduser().resolve()
+    if not is_seed_lmdb(data_dir):
+        raise FileNotFoundError(f"No data.mdb found below {data_dir}")
+    # The supplied preprocessing fixes every record to WINDOW=200 at
+    # SFREQ=200, so one stored segment is exactly one second.
+    segments_per_window_float = window_seconds
+    stride_segments_float = stride_seconds
+    segments_per_window = int(round(segments_per_window_float))
+    stride_segments = int(round(stride_segments_float))
+    if (
+        segments_per_window <= 0
+        or stride_segments <= 0
+        or not np.isclose(segments_per_window_float, segments_per_window)
+        or not np.isclose(stride_segments_float, stride_segments)
+    ):
+        raise ValueError(
+            "LMDB window-seconds and stride-seconds must be positive integer "
+            "multiples of the stored segment duration"
+        )
+
+    environment = lmdb.open(
+        str(data_dir),
+        readonly=True,
+        lock=False,
+        readahead=False,
+        meminit=False,
+        subdir=True,
+    )
+    try:
+        with environment.begin(write=False) as transaction:
+            raw_index = transaction.get(b"__keys__")
+            if raw_index is None:
+                raise KeyError("LMDB has no '__keys__' split index")
+            split_index = pickle.loads(raw_index)
+            if not isinstance(split_index, dict):
+                raise ValueError("LMDB '__keys__' value is not a split dictionary")
+            if "dev" in split_index and "val" not in split_index:
+                split_index["val"] = split_index["dev"]
+            missing = {"train", "val", "test"} - set(split_index)
+            if missing:
+                raise ValueError(f"LMDB split index is missing {sorted(missing)}")
+
+            result: dict[str, list[SeedLMDBWindow]] = {
+                "train": [], "dev": [], "test": []
+            }
+            all_seen_keys: set[str] = set()
+            for stored_split, output_split in (
+                ("train", "train"), ("val", "dev"), ("test", "test")
+            ):
+                grouped: dict[tuple[str, int], list[tuple[int, str]]] = {}
+                seen_keys: set[str] = set()
+                for raw_key in split_index[stored_split]:
+                    key = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else str(raw_key)
+                    if key in seen_keys:
+                        raise ValueError(f"Duplicate key {key!r} in LMDB split {stored_split}")
+                    if key in all_seen_keys:
+                        raise ValueError(f"LMDB key {key!r} appears in more than one split")
+                    seen_keys.add(key)
+                    all_seen_keys.add(key)
+                    match = _LMDB_KEY_PATTERN.fullmatch(key)
+                    if match is None:
+                        raise ValueError(f"Unexpected SEED LMDB key format: {key!r}")
+                    recording = match.group("recording")
+                    trial = int(match.group("trial"))
+                    segment = int(match.group("segment"))
+                    grouped.setdefault((recording, trial), []).append((segment, key))
+
+                for (recording, trial), entries in sorted(grouped.items()):
+                    entries.sort(key=lambda item: item[0])
+                    label_key = entries[0][1]
+                    _sample, trial_label = _decode_lmdb_record(
+                        transaction.get(label_key.encode("utf-8")), label_key
+                    )
+                    consecutive_runs: list[list[tuple[int, str]]] = []
+                    for entry in entries:
+                        if (
+                            not consecutive_runs
+                            or entry[0] != consecutive_runs[-1][-1][0] + 1
+                        ):
+                            consecutive_runs.append([entry])
+                        else:
+                            consecutive_runs[-1].append(entry)
+                    for run in consecutive_runs:
+                        for offset in range(
+                            0, len(run) - segments_per_window + 1, stride_segments
+                        ):
+                            candidate = run[offset:offset + segments_per_window]
+                            first_segment = candidate[0][0]
+                            keys = tuple(key for _segment, key in candidate)
+                            result[output_split].append(
+                                SeedLMDBWindow(
+                                    keys=keys,
+                                    split=output_split,
+                                    recording=recording,
+                                    subject=_subject_from_recording(recording),
+                                    trial=trial,
+                                    start_segment=first_segment,
+                                    stop_segment=first_segment + segments_per_window,
+                                    label=trial_label,
+                                )
+                            )
+    finally:
+        environment.close()
+
+    if any(not windows for windows in result.values()):
+        raise ValueError(
+            f"At least one LMDB split produced no complete windows: "
+            f"{ {name: len(values) for name, values in result.items()} }"
+        )
+    subjects = {
+        name: {window.subject for window in windows}
+        for name, windows in result.items()
+    }
+    for left, right in (("train", "dev"), ("train", "test"), ("dev", "test")):
+        overlap = subjects[left] & subjects[right]
+        if overlap:
+            raise ValueError(f"Subject leakage between {left}/{right}: {sorted(overlap)}")
+
+    split_json_path = data_dir / "subject_split.json"
+    if split_json_path.is_file():
+        with split_json_path.open("r", encoding="utf-8") as handle:
+            declared = json.load(handle)
+        if "dev" in declared and "val" not in declared:
+            declared["val"] = declared["dev"]
+        for declared_name, actual_name in (
+            ("train", "train"), ("val", "dev"), ("test", "test")
+        ):
+            if declared_name not in declared:
+                raise ValueError(f"subject_split.json has no {declared_name!r} list")
+            expected_subjects = {int(subject) for subject in declared[declared_name]}
+            if expected_subjects != subjects[actual_name]:
+                raise ValueError(
+                    f"subject_split.json disagrees with LMDB __keys__ for {declared_name}: "
+                    f"json={sorted(expected_subjects)}, lmdb={sorted(subjects[actual_name])}"
+                )
+    return result
 
 
 def to_biot_prest16(monopolar: np.ndarray) -> np.ndarray:
@@ -403,7 +616,83 @@ class SeedBIOTDataset(Dataset):
         )
 
 
-def class_counts(windows: Iterable[SeedWindow]) -> dict[int, int]:
+class SeedLMDBDataset(Dataset):
+    """Direct reader for the supplied one-second, 62-channel SEED LMDB."""
+
+    def __init__(
+        self,
+        data_dir: Path,
+        windows: Iterable[SeedLMDBWindow],
+        normalize: bool = True,
+    ):
+        _require_lmdb()
+        self.data_dir = Path(data_dir).expanduser().resolve()
+        self.windows = list(windows)
+        self.normalize = normalize
+        self._environment = None
+        self._environment_pid: int | None = None
+        if not self.windows:
+            raise ValueError("SeedLMDBDataset requires at least one complete window")
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_environment"] = None
+        state["_environment_pid"] = None
+        return state
+
+    def _db(self):
+        process_id = os.getpid()
+        if self._environment is None or self._environment_pid != process_id:
+            if self._environment is not None:
+                self._environment.close()
+            self._environment = lmdb.open(
+                str(self.data_dir),
+                readonly=True,
+                lock=False,
+                readahead=False,
+                meminit=False,
+                subdir=True,
+            )
+            self._environment_pid = process_id
+        return self._environment
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, index: int):
+        reference = self.windows[index]
+        segments: list[np.ndarray] = []
+        with self._db().begin(write=False) as transaction:
+            for key in reference.keys:
+                sample, label = _decode_lmdb_record(
+                    transaction.get(key.encode("utf-8")), key
+                )
+                if label != reference.label:
+                    raise ValueError(
+                        f"Label changes inside {reference.writeout_fn}: "
+                        f"expected {reference.label}, got {label} at {key}"
+                    )
+                segments.append(np.asarray(sample[:, 0, :], dtype=np.float32))
+
+        monopolar = np.concatenate(segments, axis=-1)
+        if not np.isfinite(monopolar).all():
+            raise ValueError(f"Non-finite EEG in {reference.writeout_fn}")
+        clip = to_biot_prest16(monopolar)
+        if self.normalize:
+            scale = np.quantile(np.abs(clip), 0.95, axis=-1, keepdims=True)
+            clip = clip / np.maximum(scale, 1e-8)
+        if not np.isfinite(clip).all():
+            raise ValueError(f"Non-finite transformed EEG in {reference.writeout_fn}")
+        return (
+            torch.from_numpy(np.ascontiguousarray(clip, dtype=np.float32)),
+            torch.tensor(reference.label, dtype=torch.long),
+            reference.writeout_fn,
+        )
+
+
+def class_counts(
+    windows: Iterable[SeedWindow | SeedLMDBWindow],
+) -> dict[int, int]:
     counts = {0: 0, 1: 0, 2: 0}
     for window in windows:
         counts[window.label] += 1

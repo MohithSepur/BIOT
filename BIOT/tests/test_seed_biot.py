@@ -1,15 +1,20 @@
 from pathlib import Path
+import json
+import pickle
 import tempfile
 import unittest
 
 import numpy as np
 from scipy.io import savemat
 import torch
+import seed_data
 
 from seed_data import (
     BIOT_PREST16_CHANNELS,
     SEED_CHANNELS,
     SeedBIOTDataset,
+    SeedLMDBDataset,
+    discover_seed_lmdb_windows,
     discover_seed_windows,
     prepare_seed_cache,
     split_seed_windows,
@@ -150,6 +155,104 @@ class SeedBIOTTest(unittest.TestCase):
             torch.testing.assert_close(
                 cached_resampled[0], uncached_resampled[0], rtol=0, atol=0
             )
+
+    def test_lmdb_split_grouping_and_dataset_contract(self) -> None:
+        class FakeTransaction:
+            def __init__(self, records):
+                self.records = records
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def get(self, key):
+                return self.records.get(key)
+
+        class FakeEnvironment:
+            def __init__(self, records):
+                self.records = records
+
+            def begin(self, write=False):
+                self.assert_readonly = not write
+                return FakeTransaction(self.records)
+
+            def close(self):
+                pass
+
+        class FakeLMDB:
+            def __init__(self, records):
+                self.records = records
+
+            def open(self, *_args, **_kwargs):
+                return FakeEnvironment(self.records)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "data.mdb").touch()
+            split_keys = {"train": [], "val": [], "test": []}
+            records = {}
+            for split_name, subject, label, segment_indices in (
+                ("train", 1, 0, [0, 1, *range(5, 15)]),
+                ("val", 2, 1, range(10)),
+                ("test", 3, 2, range(10)),
+            ):
+                for segment in segment_indices:
+                    key = f"{subject}_session.mat-1-{segment}"
+                    split_keys[split_name].append(key)
+                    sample = np.zeros((62, 1, 200), dtype=np.float64)
+                    sample[SEED_CHANNELS.index("FP1")] = 3 + segment
+                    sample[SEED_CHANNELS.index("F7")] = 1
+                    records[key.encode()] = pickle.dumps(
+                        {"sample": sample, "label": label}
+                    )
+            records[b"__keys__"] = pickle.dumps(split_keys)
+            (root / "subject_split.json").write_text(
+                json.dumps({"train": ["1"], "val": ["2"], "test": ["3"]}),
+                encoding="utf-8",
+            )
+
+            original_lmdb = seed_data.lmdb
+            seed_data.lmdb = FakeLMDB(records)
+            try:
+                split = discover_seed_lmdb_windows(root)
+                self.assertEqual(
+                    {name: len(windows) for name, windows in split.items()},
+                    {"train": 1, "dev": 1, "test": 1},
+                )
+                self.assertEqual(
+                    {name: {window.subject for window in windows}
+                     for name, windows in split.items()},
+                    {"train": {1}, "dev": {2}, "test": {3}},
+                )
+                dataset = SeedLMDBDataset(root, split["train"], normalize=False)
+                x, y, writeout_fn = dataset[0]
+                self.assertEqual(tuple(x.shape), (16, 2000))
+                self.assertEqual(y.item(), 0)
+                expected = torch.cat(
+                    [torch.full((200,), float(2 + segment)) for segment in range(5, 15)]
+                )
+                torch.testing.assert_close(x[0], expected)
+                self.assertIn("segments000005-000015", writeout_fn)
+
+                model, report = build_seed_biot(CHECKPOINT)
+                self.assertTrue(report["checkpoint_loaded"])
+                optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+                logits = model(x.unsqueeze(0))
+                self.assertEqual(tuple(logits.shape), (1, 3))
+                loss = torch.nn.CrossEntropyLoss()(logits, y.unsqueeze(0))
+                loss.backward()
+                self.assertTrue(
+                    all(
+                        torch.isfinite(parameter.grad).all()
+                        for parameter in model.parameters()
+                        if parameter.grad is not None
+                    )
+                )
+                optimizer.step()
+            finally:
+                seed_data.lmdb = original_lmdb
 
 
 if __name__ == "__main__":

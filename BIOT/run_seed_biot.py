@@ -25,8 +25,11 @@ from tqdm import tqdm
 
 from seed_data import (
     SeedBIOTDataset,
+    SeedLMDBDataset,
     class_counts,
     discover_seed_windows,
+    discover_seed_lmdb_windows,
+    is_seed_lmdb,
     prepare_seed_cache,
     split_seed_windows,
 )
@@ -172,10 +175,22 @@ def metric_log(metrics):
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune BIOT on three-class SEED")
     parser.add_argument("--data-dir", type=Path, required=True)
+    parser.add_argument(
+        "--data-format",
+        choices=("auto", "lmdb", "mat"),
+        default="auto",
+        help="Input storage; auto selects LMDB when DATA_DIR/data.mdb exists",
+    )
     parser.add_argument("--label-file", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--test-subject", type=int, required=True)
-    parser.add_argument("--dev-subject", type=int, required=True)
+    parser.add_argument(
+        "--test-subject", type=int, default=None,
+        help="MAT input only; LMDB uses its stored subject split",
+    )
+    parser.add_argument(
+        "--dev-subject", type=int, default=None,
+        help="MAT input only; LMDB uses its stored subject split",
+    )
     parser.add_argument("--source-sampling-rate", type=int, default=200)
     parser.add_argument("--window-seconds", type=float, default=10.0)
     parser.add_argument("--stride-seconds", type=float, default=10.0)
@@ -235,38 +250,62 @@ def main():
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    windows = discover_seed_windows(
-        args.data_dir,
-        args.label_file,
-        source_sampling_rate=args.source_sampling_rate,
-        window_seconds=args.window_seconds,
-        stride_seconds=args.stride_seconds,
-    )
+    data_dir = args.data_dir.expanduser().resolve()
+    data_format = args.data_format
+    if data_format == "auto":
+        data_format = "lmdb" if is_seed_lmdb(data_dir) else "mat"
     cache_dir = None
     cache_report = None
-    if not args.no_cache:
-        cache_dir = (
-            args.cache_dir.expanduser().resolve()
-            if args.cache_dir is not None
-            else args.data_dir.expanduser().resolve() / ".biot_seed_cache_v1"
+    if data_format == "lmdb":
+        if args.source_sampling_rate != 200:
+            raise ValueError("This SEED LMDB was created at 200 Hz")
+        if args.label_file is not None or args.cache_dir is not None or args.rebuild_cache:
+            raise ValueError(
+                "--label-file/--cache-dir/--rebuild-cache apply only to MAT input; "
+                "LMDB is loaded directly without another cache"
+            )
+        split = discover_seed_lmdb_windows(
+            data_dir,
+            window_seconds=args.window_seconds,
+            stride_seconds=args.stride_seconds,
         )
-        cache_report = prepare_seed_cache(
-            windows,
-            cache_dir,
+        datasets = {
+            name: SeedLMDBDataset(data_dir, values)
+            for name, values in split.items()
+        }
+    else:
+        if args.test_subject is None or args.dev_subject is None:
+            raise ValueError("MAT input requires --test-subject and --dev-subject")
+        windows = discover_seed_windows(
+            data_dir,
+            args.label_file,
             source_sampling_rate=args.source_sampling_rate,
-            rebuild=args.rebuild_cache,
+            window_seconds=args.window_seconds,
+            stride_seconds=args.stride_seconds,
         )
-        print(f"Trial cache: {cache_dir} ({cache_report})")
-    split = split_seed_windows(windows, args.test_subject, args.dev_subject)
-    datasets = {
-        name: SeedBIOTDataset(
-            values,
-            source_sampling_rate=args.source_sampling_rate,
-            target_sampling_rate=200,
-            cache_dir=cache_dir,
-        )
-        for name, values in split.items()
-    }
+        if not args.no_cache:
+            cache_dir = (
+                args.cache_dir.expanduser().resolve()
+                if args.cache_dir is not None
+                else data_dir / ".biot_seed_cache_v1"
+            )
+            cache_report = prepare_seed_cache(
+                windows,
+                cache_dir,
+                source_sampling_rate=args.source_sampling_rate,
+                rebuild=args.rebuild_cache,
+            )
+            print(f"Trial cache: {cache_dir} ({cache_report})")
+        split = split_seed_windows(windows, args.test_subject, args.dev_subject)
+        datasets = {
+            name: SeedBIOTDataset(
+                values,
+                source_sampling_rate=args.source_sampling_rate,
+                target_sampling_rate=200,
+                cache_dir=cache_dir,
+            )
+            for name, values in split.items()
+        }
     loader_worker_options = (
         {
             "persistent_workers": True,
@@ -288,6 +327,7 @@ def main():
     }
     counts = {name: class_counts(values) for name, values in split.items()}
     print(f"Device: {device}")
+    print(f"Data format: {data_format}")
     print(f"Windows: { {name: len(values) for name, values in split.items()} }")
     print(f"Class counts [negative, neutral, positive]: {counts}")
 
@@ -305,7 +345,8 @@ def main():
 
     run_config = vars(args).copy()
     run_config.update(
-        data_dir=str(args.data_dir),
+        data_dir=str(data_dir),
+        data_format=data_format,
         label_file=str(args.label_file) if args.label_file else None,
         output_dir=str(output_dir),
         checkpoint=str(checkpoint) if checkpoint else None,
