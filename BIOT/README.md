@@ -158,7 +158,52 @@ python run_multiclass_supervised.py --dataset TUEV --in_channels 18 --n_classes 
 ```
 
 
-## 5. Citations
+## 5. Sleep-EDF Expanded sleep staging
+
+The Sleep-EDF pipeline is separate from the SEED and seizure pipelines. It
+uses the two official EEG derivations (`EEG Fpz-Cz` and `EEG Pz-Oz`), merges
+stages 3 and 4 into N3, retains at most 30 minutes of wake before the first and
+after the last sleep epoch, low-pass filters at 30 Hz, and applies per-epoch,
+per-channel z-score normalization. The default `cassette` cohort matches the
+cohort selected by the repository's upstream SleepPhysionet preparation.
+
+Preprocess the downloaded official EDF directory once:
+
+```bash
+python prepare_sleep_edf.py \
+  --raw-dir /path/to/sleep-edfx/1.0.0 \
+  --output-dir /path/to/sleep-edf-processed
+```
+
+This creates a deterministic 60/20/20 subject-level split and memory-mapped
+recording arrays. Both nights from a participant remain in the same split.
+Run full BIOT fine-tuning with:
+
+```bash
+python run_sleep_biot.py \
+  --data-dir /path/to/sleep-edf-processed \
+  --output-dir ./results/sleep_edf/full_model \
+  --epochs 40 \
+  --batch-size 64 \
+  --num-workers 4 \
+  --prefetch-factor 4 \
+  --device cuda
+```
+
+The boundary follows the repository's existing BIOT Sleep-EDF design: a
+max-norm-constrained learned 1x1 convolution projects the two Sleep-EDF EEG
+channels into the selected checkpoint's space. The adapter derives whether an
+official checkpoint contains 16 or 18 channel tokens and rejects other shapes;
+the default is the 16-channel PREST checkpoint. The BIOT backbone itself is
+unchanged and fully fine-tuned by default. The best validation macro-F1
+checkpoint is written to `best_model.pt`; add `--evaluate-only` to the same
+training command to reload it and regenerate dev/test results.
+
+The fixed holdout is leakage-safe but is not the upstream script's 10-fold
+cross-validation protocol. Do not compare the resulting numbers directly with
+a paper that uses a different subject cohort or cross-validation protocol.
+
+## 6. Citations
 ```bibtex
 @inproceedings{yang2023biot,
     title={BIOT: Biosignal Transformer for Cross-data Learning in the Wild},
