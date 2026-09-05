@@ -191,13 +191,21 @@ python run_sleep_biot.py \
 ```
 
 The boundary follows the repository's existing BIOT Sleep-EDF design: a
-max-norm-constrained learned 1x1 convolution projects the two Sleep-EDF EEG
-channels into the selected checkpoint's space. The adapter derives whether an
+common-average reference is applied before a max-norm-constrained learned 1x1
+convolution projects the two Sleep-EDF EEG channels into the selected
+checkpoint's space. The adapter derives whether an
 official checkpoint contains 16 or 18 channel tokens and rejects other shapes;
 the default is the 16-channel PREST checkpoint. The BIOT backbone itself is
 unchanged and fully fine-tuned by default. The best validation macro-F1
 checkpoint is written to `best_model.pt`; add `--evaluate-only` to the same
 training command to reload it and regenerate dev/test results.
+
+Sampling caveat: this deliberately preserves the bundled Sleep-EDF script's
+3,000-sample input, although Sleep-EDF is 100 Hz and the BIOT checkpoints are
+documented as 200-Hz models. Resampling a full 30-second epoch to 6,000 points
+would change token counts and makes the 18-channel sequence exceed BIOT's
+configured 1,024-token limit. Treat a 200-Hz variant as a separate experiment,
+not as an interchangeable preprocessing switch.
 
 The fixed holdout is leakage-safe but is not the upstream script's 10-fold
 cross-validation protocol. Do not compare the resulting numbers directly with

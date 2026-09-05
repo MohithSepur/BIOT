@@ -36,7 +36,7 @@ class BIOTSleepModel(nn.Module):
         )
         self.backbone = backbone
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def adapt_input(self, inputs: torch.Tensor) -> torch.Tensor:
         expected = (len(SLEEP_CHANNELS), EPOCH_SAMPLES)
         if inputs.ndim != 3 or tuple(inputs.shape[1:]) != expected:
             raise ValueError(
@@ -47,7 +47,13 @@ class BIOTSleepModel(nn.Module):
             raise TypeError(f"Sleep-EDF input must be floating point, got {inputs.dtype}")
         if not bool(torch.isfinite(inputs).all()):
             raise ValueError("Sleep-EDF input contains NaN or infinity")
-        return self.backbone(self.channel_projection(inputs))
+        # Match the repository's bundled Sleep-EDF boundary.  Its
+        # temporal_interpolation helper performs common-average referencing
+        # before the learned 2 -> 16/18 channel projection.
+        return inputs - inputs.mean(dim=1, keepdim=True)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.backbone(self.channel_projection(self.adapt_input(inputs)))
 
 
 def _load_checkpoint(path: Path):
@@ -111,5 +117,8 @@ def build_sleep_biot(
         "raw_channels": list(SLEEP_CHANNELS),
         "projected_channels": projected_channels,
         "num_classes": NUM_CLASSES,
+        "input_sampling_rate_hz": 100,
+        "checkpoint_sampling_rate_hz": 200,
+        "sampling_policy": "bundled_sleep_edf_3000_sample_path",
     }
     return model, report

@@ -112,6 +112,8 @@ class SleepBIOTTest(unittest.TestCase):
             "test": 2,
         })
         self.assertEqual(len(set(split["train"]) & set(split["test"])), 0)
+        with self.assertRaisesRegex(ValueError, "three unique subjects"):
+            make_subject_split(["SC00", "SC00", "SC01"], 7, 0.6, 0.2)
 
     def test_actual_biot_checkpoint_forward_backward_optimizer_step(self):
         self.assertTrue(CHECKPOINT.is_file())
@@ -119,6 +121,8 @@ class SleepBIOTTest(unittest.TestCase):
         self.assertTrue(report["checkpoint_loaded"])
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
         inputs = torch.randn(1, 2, EPOCH_SAMPLES)
+        adapted = model.adapt_input(inputs)
+        self.assertLess(float(adapted.mean(dim=1).abs().max()), 1e-6)
         labels = torch.tensor([2])
         logits = model(inputs)
         self.assertEqual(tuple(logits.shape), (1, 5))

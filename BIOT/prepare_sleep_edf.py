@@ -81,9 +81,9 @@ def make_subject_split(
         raise ValueError("train/dev fractions must be between zero and one")
     if train_fraction + dev_fraction >= 1:
         raise ValueError("train_fraction + dev_fraction must be below one")
-    if len(subjects) < 3:
-        raise ValueError("At least three subjects are required for train/dev/test")
     ordered = sorted(set(subjects))
+    if len(ordered) < 3:
+        raise ValueError("At least three unique subjects are required for train/dev/test")
     rng = np.random.RandomState(seed)
     rng.shuffle(ordered)
     train_stop = max(1, int(len(ordered) * train_fraction))
